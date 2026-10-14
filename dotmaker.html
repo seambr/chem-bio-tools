@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>index</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #111719; color: #e1e9e7; font: 14px system-ui, sans-serif; }
+  main { max-width: 1200px; margin: auto; }
+  .toolbar { align-items: center; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type=number] { width: 68px; padding: 8px; color: #e1e9e7; background: #1b2521; border: 1px solid #496357; border-radius: 5px; }
+  select { padding: 8px; color: #e1e9e7; background: #1b2521; border: 1px solid #496357; border-radius: 5px; }
+  input[type=checkbox] { accent-color: #96e5b0; }
+  #status:empty { display: none; }
+  p { color: #a4b6b0; line-height: 1.6; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 12px; }
+  button { padding: 10px 15px; border: 1px solid #496357; border-radius: 6px; background: #263a30; color: white; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { margin: 10px 0; min-height: 22px; }
+  #stage { position: relative; width: 100%; background: #000; overflow: hidden; aspect-ratio: 4 / 3; }
+  video { position: absolute; display: block; width: 100%; height: auto; max-width: none; }
+  video:not([data-ready]) { aspect-ratio: 4 / 3; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  pre { padding: 18px; background: #1b2521; border-radius: 6px; overflow: auto; line-height: 1.6; }
+  code { color: #a7e6bd; }
+  summary { cursor: pointer; padding: 16px 0; }
+</style>
+</head>
+<body><main>
+<div class="toolbar">
+  <button id="start">Start capture</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="crop" disabled>Crop</button>
+  <button id="resetCrop" disabled>Reset crop</button>
+  <button id="clear">Clear annotations</button>
+  <label>Every <input id="interval" type="number" min="0.05" step="0.05" value="0.5"> s</label>
+  <label>Palette <select id="palette"><option value="gray">Grayscale</option><option value="jet" selected>Rainbow (Jet)</option></select></label>
+  <label>Mode <select id="method"><option value="profile" selected>Profile peak</option><option value="centroid">Centroid</option></select></label>
+  <label>Threshold <input id="threshold" title="Ignore signal below this percent of the background-subtracted peak" type="number" min="0" max="99" step="1" value="10"> %</label>
+  <label><input id="tracking" type="checkbox" checked> Track beam</label>
+  <label><input id="trail" type="checkbox"> Keep dots</label>
+  <label><input id="showMean" type="checkbox"> Center of mass (X)</label>
+</div>
+<p id="status" role="status"></p>
+<div id="stage">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay" width="1920" height="1440"></canvas>
+</div>
+
+</main>
+<script>
+"use strict";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const ctx = overlay.getContext("2d");
+const status = document.getElementById("status");
+const startButton = document.getElementById("start");
+const stopButton = document.getElementById("stop");
+const drawings = new Map();
+let stream = null;
+const stage = document.getElementById("stage");
+const cropButton = document.getElementById("crop");
+const resetCropButton = document.getElementById("resetCrop");
+let cropRegion = null;
+let selectingCrop = false;
+let dragStart = null;
+let sourceWidth = 0, sourceHeight = 0;
+
+function sourceRegion() {
+  return cropRegion ?? {x: 0, y: 0, width: video.videoWidth || 1920, height: video.videoHeight || 1440};
+}
+
+// Crop visually by clipping the video, without copying each video frame.
+function updateView() {
+  const r = selectingCrop
+    ? {x: 0, y: 0, width: video.videoWidth, height: video.videoHeight}
+    : sourceRegion();
+  if (!r.width || !r.height) return;
+  stage.style.aspectRatio = `${r.width} / ${r.height}`;
+  video.style.width = `${100 * (video.videoWidth || r.width) / r.width}%`;
+  video.style.left = `${-100 * r.x / r.width}%`;
+  video.style.top = `${-100 * r.y / r.height}%`;
+  overlay.width = r.width;
+  overlay.height = r.height;
+  if (!selectingCrop) redrawAnnotations();
+  resetCropButton.disabled = !stream || !cropRegion;
+}
+
+function finishCropSelection() {
+  selectingCrop = false;
+  dragStart = null;
+  overlay.style.pointerEvents = "none";
+  overlay.style.cursor = "default";
+  cropButton.textContent = "Crop";
+  updateView();
+  restartTracking();
+}
+
+function applyCrop(region) {
+  cropRegion = region;
+  // Coordinates now refer to a different image; discard stale annotations.
+  drawings.clear();
+  capture.centroid = null;
+  finishCropSelection();
+}
+
+cropButton.onclick = () => {
+  if (selectingCrop) { finishCropSelection(); return; }
+  selectingCrop = true;
+  clearTimeout(centroidTimer);
+  updateView();
+  overlay.style.pointerEvents = "auto";
+  overlay.style.touchAction = "none";
+  overlay.style.cursor = "crosshair";
+  cropButton.textContent = "Cancel crop";
+  status.textContent = "Drag a rectangle around the beam area.";
+};
+resetCropButton.onclick = () => applyCrop(null);
+
+function pointerPosition(event) {
+  const box = overlay.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(overlay.width, (event.clientX - box.left) * overlay.width / box.width)),
+    y: Math.max(0, Math.min(overlay.height, (event.clientY - box.top) * overlay.height / box.height))
+  };
+}
+function selectionRectangle(a, b) {
+  const x = Math.floor(Math.min(a.x, b.x)), y = Math.floor(Math.min(a.y, b.y));
+  return {x, y, width: Math.ceil(Math.max(a.x, b.x)) - x, height: Math.ceil(Math.max(a.y, b.y)) - y};
+}
+overlay.addEventListener("pointerdown", event => {
+  if (!selectingCrop || event.button !== 0) return;
+  dragStart = pointerPosition(event);
+  overlay.setPointerCapture(event.pointerId);
+});
+overlay.addEventListener("pointermove", event => {
+  if (!selectingCrop || !dragStart) return;
+  const r = selectionRectangle(dragStart, pointerPosition(event));
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  ctx.fillRect(0, 0, overlay.width, overlay.height);
+  ctx.clearRect(r.x, r.y, r.width, r.height);
+  ctx.strokeStyle = "#7affb3";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(r.x, r.y, r.width, r.height);
+});
+overlay.addEventListener("pointerup", event => {
+  if (!selectingCrop || !dragStart) return;
+  const r = selectionRectangle(dragStart, pointerPosition(event));
+  if (overlay.hasPointerCapture(event.pointerId)) overlay.releasePointerCapture(event.pointerId);
+  dragStart = null;
+  if (r.width >= 4 && r.height >= 4) applyCrop(r);
+  else status.textContent = "Select a larger region.";
+});
+overlay.addEventListener("pointercancel", () => { if (selectingCrop) finishCropSelection(); });
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && selectingCrop) finishCropSelection();
+});
+
+// Equal weight per dot/sample. The latest dot also appears in history when
+// Keep dots is enabled; sampleId prevents counting that sample twice.
+function meanOfDots(items) {
+  let x = 0, y = 0, count = 0;
+  const seen = new Set();
+  for (const d of items) {
+    if (!d || d.type !== "dot" || !Number.isFinite(d.x) || !Number.isFinite(d.y)) continue;
+    if (d.sampleId !== undefined) {
+      if (seen.has(d.sampleId)) continue;
+      seen.add(d.sampleId);
+    }
+    x += d.x; y += d.y; count++;
+  }
+  return count ? {x: x / count, y: y / count, count} : null;
+}
+
+function drawDotMean() {
+  if (!document.getElementById("showMean").checked) return;
+  const mean = meanOfDots(drawings.values());
+  if (!mean) return;
+  // Approximately constant marker size on screen even when the crop is zoomed.
+  const scale = overlay.width / (overlay.clientWidth || overlay.width);
+  const size = 10 * scale;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(mean.x - size, mean.y - size);
+  ctx.lineTo(mean.x + size, mean.y + size);
+  ctx.moveTo(mean.x - size, mean.y + size);
+  ctx.lineTo(mean.x + size, mean.y - size);
+  ctx.strokeStyle = "black"; ctx.lineWidth = 5 * scale; ctx.stroke();
+  ctx.strokeStyle = "#00ffff"; ctx.lineWidth = 2.5 * scale; ctx.stroke();
+  ctx.restore();
+}
+document.getElementById("showMean").addEventListener("change", redrawAnnotations);
+
+// Drawings are stored independently from the video. No per-frame redraw needed.
+function redrawAnnotations() {
+  if (selectingCrop) return;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  for (const [id, drawing] of drawings) {
+    ctx.save();
+    try {
+      if (typeof drawing === "function") {
+        drawing(ctx, overlay.width, overlay.height);
+      } else {
+        const d = drawing;
+        ctx.strokeStyle = ctx.fillStyle = d.color ?? "lime";
+        ctx.lineWidth = d.lineWidth ?? 2;
+        ctx.beginPath();
+        switch (d.type) {
+          case "crosshair": {
+            const s = d.size ?? 20;
+            ctx.moveTo(d.x - s, d.y); ctx.lineTo(d.x + s, d.y);
+            ctx.moveTo(d.x, d.y - s); ctx.lineTo(d.x, d.y + s);
+            ctx.stroke(); break;
+          }
+          case "dot":
+            ctx.arc(d.x, d.y, d.radius ?? 5, 0, Math.PI * 2);
+            ctx.fill(); ctx.strokeStyle = "white"; ctx.lineWidth = 1; ctx.stroke(); break;
+          case "circle":
+            ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2); ctx.stroke(); break;
+          case "rect":
+            ctx.strokeRect(d.x, d.y, d.width, d.height); break;
+          case "line":
+            ctx.moveTo(d.x1, d.y1); ctx.lineTo(d.x2, d.y2); ctx.stroke(); break;
+          case "text":
+            ctx.font = `${d.fontSize ?? 24}px sans-serif`;
+            ctx.fillText(d.text, d.x, d.y); break;
+          default: throw new Error("Unknown annotation type: " + d.type);
+        }
+      }
+    } catch (error) {
+      console.error("Annotation failed:", id, error);
+    } finally {
+      ctx.restore();
+    }
+  }
+  drawDotMean();
+}
+
+window.annotations = {
+  set(id, drawing) {
+    drawings.set(id, typeof drawing === "function" ? drawing : {...drawing});
+    redrawAnnotations();
+  },
+  remove(id) { drawings.delete(id); redrawAnnotations(); },
+  clear() { drawings.clear(); redrawAnnotations(); },
+  redraw: redrawAnnotations
+};
+
+// Match the overlay's backing resolution to the source video.
+// CSS scales both layers together, preserving alignment at any display size.
+function syncSize() {
+  if (!video.videoWidth || !video.videoHeight) return;
+  video.dataset.ready = "true";
+  if (sourceWidth !== video.videoWidth || sourceHeight !== video.videoHeight) {
+    sourceWidth = video.videoWidth; sourceHeight = video.videoHeight;
+    cropRegion = null;
+    drawings.clear();
+    if (selectingCrop) finishCropSelection();
+  }
+  cropButton.disabled = false;
+  updateView();
+  status.textContent = `Streaming · ${overlay.width} × ${overlay.height} pixels`;
+}
+video.addEventListener("loadedmetadata", syncSize);
+video.addEventListener("resize", syncSize);
+
+function stopCapture() {
+  clearTimeout(centroidTimer);
+  selectingCrop = false;
+  dragStart = null;
+  overlay.style.pointerEvents = "none";
+  cropButton.textContent = "Crop";
+  cropButton.disabled = true;
+  resetCropButton.disabled = true;
+  const previous = stream;
+  stream = null;
+  if (previous) previous.getTracks().forEach(track => track.stop());
+  video.srcObject = null;
+  video.removeAttribute("data-ready");
+  startButton.disabled = false;
+  stopButton.disabled = true;
+  status.textContent = "Stopped.";
+}
+
+startButton.addEventListener("click", async () => {
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    status.textContent = "Screen capture unavailable. Try a desktop browser on localhost or HTTPS.";
+    return;
+  }
+  startButton.disabled = true;
+  status.textContent = "Choose a source in the browser's sharing dialog…";
+  try {
+    // This must be called from a user gesture (the Start button).
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {frameRate: {ideal: 60}}, audio: false
+    });
+    const activeStream = stream;
+    stream.getVideoTracks()[0].addEventListener("ended", () => {
+      if (stream === activeStream) stopCapture();
+    });
+    cropRegion = null;
+    drawings.clear();
+    video.srcObject = stream;
+    await video.play();
+    if (stream !== activeStream) return;
+    stopButton.disabled = false;
+    syncSize();
+    restartTracking();
+  } catch (error) {
+    stopCapture();
+    status.textContent = `Capture did not start: ${error.message || error.name}`;
+  }
+});
+stopButton.addEventListener("click", stopCapture);
+window.addEventListener("pagehide", stopCapture);
+document.getElementById("clear").onclick = () => annotations.clear();
+
+// Pixels are copied ONLY when your analysis explicitly requests a frame.
+const frameCanvas = document.createElement("canvas");
+const frameContext = frameCanvas.getContext("2d", {willReadFrequently: true});
+window.capture = {
+  video,
+  stop: stopCapture,
+  get crop() { return {...sourceRegion()}; },
+  get dotMean() { return meanOfDots(drawings.values()); },
+  getFrame() {
+    if (!stream || video.readyState < 2) throw new Error("Start capture before reading a frame.");
+    const r = sourceRegion();
+    if (frameCanvas.width !== r.width || frameCanvas.height !== r.height) {
+      frameCanvas.width = r.width;
+      frameCanvas.height = r.height;
+    }
+    frameContext.drawImage(video, r.x, r.y, r.width, r.height, 0, 0, r.width, r.height);
+    return frameContext.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
+  }
+};
+
+// Shared Jet palette: blue (low) -> cyan -> yellow -> red (high).
+// Zero is black in the test source. This is a preset, not an Ophir calibration.
+function jetColor(t) {
+  const clamp = value => Math.max(0, Math.min(1, value));
+  return [3, 2, 1].map(center => Math.round(255 * clamp(1.5 - Math.abs(4 * t - center))));
+}
+const jetPalette = Array.from({length: 256}, (_, i) => jetColor(i / 255));
+// Quantized RGB cache makes repeated frame decoding inexpensive.
+const jetCache = new Float32Array(32768).fill(-1);
+function jetIntensity(r, g, b) {
+  if (Math.max(r, g, b) < 12) return 0;
+  // Reject neutral white/gray UI pixels, which are not part of this palette.
+  if (Math.max(r, g, b) - Math.min(r, g, b) < 20) return 0;
+  const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+  if (jetCache[key] >= 0) return jetCache[key];
+  const qr = (r >> 3) * 8 + 3.5, qg = (g >> 3) * 8 + 3.5, qb = (b >> 3) * 8 + 3.5;
+  let best = 0, distance = Infinity;
+  for (let i = 0; i < jetPalette.length; i++) {
+    const color = jetPalette[i];
+    const d = (qr - color[0]) ** 2 + (qg - color[1]) ** 2 + (qb - color[2]) ** 2;
+    if (d < distance) { distance = d; best = i; }
+  }
+  // Reject colors far from the selected palette rather than inventing intensity.
+  jetCache[key] = distance <= 90 ** 2 ? best : 0;
+  return jetCache[key];
+}
+function pixelIntensity(data, j, palette) {
+  return palette === "jet" ? jetIntensity(data[j], data[j + 1], data[j + 2])
+    : 0.2126 * data[j] + 0.7152 * data[j + 1] + 0.0722 * data[j + 2];
+}
+
+// Intensity-weighted centroid of a bright beam on a dark background.
+// Subtract the darkest intensity, then exclude pixels below a fraction of peak.
+// This reads the source video only; overlay dots never enter the calculation.
+function findCentroid(frame, thresholdFraction = 0.10, palette = "gray") {
+  const {data, width, height} = frame;
+  const count = width * height;
+  const intensity = new Float32Array(count);
+  let background = Infinity, peak = 0;
+  for (let i = 0; i < count; i++) {
+    const j = i * 4;
+    const value = pixelIntensity(data, j, palette);
+    intensity[i] = value;
+    background = Math.min(background, value);
+    peak = Math.max(peak, value);
+  }
+  if (peak - background < 5) return null;
+  const cutoff = (peak - background) * thresholdFraction;
+  let total = 0, weightedX = 0, weightedY = 0;
+  for (let y = 0, i = 0; y < height; y++) {
+    for (let x = 0; x < width; x++, i++) {
+      const weight = intensity[i] - background;
+      if (weight <= cutoff) continue;
+      total += weight;
+      weightedX += x * weight;
+      weightedY += y * weight;
+    }
+  }
+  return total > 0 ? {x: weightedX / total, y: weightedY / total} : null;
+}
+
+// Smooth each summed profile with [1, 2, 1] / 4, then find its peak.
+// A parabola through the peak and its neighbors estimates a subpixel position.
+function profilePeak(profile) {
+  if (profile.length < 3) return null;
+  const smooth = new Float64Array(profile.length);
+  for (let i = 0; i < profile.length; i++) {
+    smooth[i] = (profile[Math.max(0, i - 1)] + 2 * profile[i]
+      + profile[Math.min(profile.length - 1, i + 1)]) / 4;
+  }
+  let peak = 0;
+  for (let i = 1; i < smooth.length; i++) {
+    if (smooth[i] > smooth[peak]) peak = i;
+  }
+  if (smooth[peak] <= 0) return null;
+  // Center an exactly flat maximum instead of choosing its first pixel.
+  let end = peak;
+  while (end + 1 < smooth.length && smooth[end + 1] === smooth[peak]) end++;
+  if (end > peak) return (peak + end) / 2;
+  if (peak === 0 || peak === smooth.length - 1) return peak;
+  const left = smooth[peak - 1], middle = smooth[peak], right = smooth[peak + 1];
+  const curvature = left - 2 * middle + right;
+  const offset = curvature < 0 ? 0.5 * (left - right) / curvature : 0;
+  return peak + Math.max(-0.5, Math.min(0.5, offset));
+}
+
+function findProfilePeak(frame, thresholdFraction = 0.10, palette = "gray") {
+  const {data, width, height} = frame;
+  const intensity = new Float32Array(width * height);
+  const histogram = new Uint32Array(256);
+  let maximum = 0;
+  for (let i = 0; i < intensity.length; i++) {
+    const j = i * 4;
+    const value = pixelIntensity(data, j, palette);
+    intensity[i] = value;
+    histogram[Math.round(value)]++;
+    maximum = Math.max(maximum, value);
+  }
+  // Robust to individual dark pixels; assumes the crop is mostly background.
+  let background = 0, cumulative = 0;
+  for (; background < 255; background++) {
+    cumulative += histogram[background];
+    if (cumulative >= intensity.length / 2) break;
+  }
+  if (maximum - background < 5) return null;
+  const cutoff = (maximum - background) * thresholdFraction;
+  const profileX = new Float64Array(width);
+  const profileY = new Float64Array(height);
+  for (let y = 0, i = 0; y < height; y++) {
+    for (let x = 0; x < width; x++, i++) {
+      const weight = intensity[i] - background;
+      if (weight <= cutoff) continue;
+      profileX[x] += weight;
+      profileY[y] += weight;
+    }
+  }
+  const x = profilePeak(profileX), y = profilePeak(profileY);
+  if (x === null || y === null) return null;
+  return {x, y};
+}
+
+let centroidTimer = null;
+let dotNumber = 0;
+let sampleNumber = 0;
+window.capture.findCentroid = findCentroid;
+window.capture.findProfilePeak = findProfilePeak;
+window.capture.centroid = null;
+
+function sampleCentroid() {
+  if (!stream || video.readyState < 2) return;
+  const thresholdInput = document.getElementById("threshold");
+  const fraction = Math.max(0, Math.min(0.99, Number(thresholdInput.value) / 100));
+  const method = document.getElementById("method").value;
+  const frame = capture.getFrame();
+  const palette = document.getElementById("palette").value;
+  const center = method === "profile"
+    ? findProfilePeak(frame, fraction, palette)
+    : findCentroid(frame, fraction, palette);
+  capture.centroid = center;
+  if (!center) {
+    annotations.remove("centroid");
+    status.textContent = "No beam detected";
+    return;
+  }
+  const dot = {type: "dot", ...center, radius: 5, color: "#ff384c", sampleId: sampleNumber++};
+  if (document.getElementById("trail").checked) {
+    // Bound history to avoid unlimited memory/rendering cost.
+    drawings.set(`centroid-history-${dotNumber}`, dot);
+    if (dotNumber >= 2000) drawings.delete(`centroid-history-${dotNumber - 2000}`);
+    dotNumber++;
+  }
+  annotations.set("centroid", dot);
+  status.textContent = `X ${center.x.toFixed(1)} · Y ${center.y.toFixed(1)} px`;
+}
+
+function restartTracking() {
+  clearTimeout(centroidTimer);
+  if (!stream || selectingCrop || !document.getElementById("tracking").checked) return;
+  function tick() {
+    if (!stream || selectingCrop || !document.getElementById("tracking").checked) return;
+    const started = performance.now();
+    try { sampleCentroid(); }
+    catch (error) { status.textContent = `Tracking error: ${error.message}`; }
+    const seconds = Math.max(0.05, Number(document.getElementById("interval").value) || 0.5);
+    centroidTimer = setTimeout(tick, Math.max(0, seconds * 1000 - (performance.now() - started)));
+  }
+  tick();
+}
+for (const control of ["method", "palette"]) document.getElementById(control).addEventListener("change", () => {
+  // Do not mix historical points measured by different methods.
+  for (const id of drawings.keys()) {
+    if (id === "centroid" || id.startsWith("centroid-history-")) drawings.delete(id);
+  }
+  capture.centroid = null;
+  redrawAnnotations();
+  restartTracking();
+});
+for (const id of ["interval", "threshold", "tracking"]) {
+  document.getElementById(id).addEventListener("change", restartTracking);
+}
+</script>
+</body>
+</html>
